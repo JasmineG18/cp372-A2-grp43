@@ -32,29 +32,23 @@ public class Sender {
         // ================= HANDSHAKE =================
         DSPacket sot = new DSPacket(DSPacket.TYPE_SOT, 0, null);
 
+        System.out.println("Sender: Sending SOT");
+
         while (true) {
             sendPacket(socket, sot, rcvIP, rcvDataPort);
             try {
                 DSPacket ack = receivePacket(socket);
                 if (ack.getType() == DSPacket.TYPE_ACK && ack.getSeqNum() == 0) {
+                    System.out.println("Sender: ACK received for SOT");
                     break;
                 }
             } catch (SocketTimeoutException e) {
+                System.out.println("Sender: Timeout waiting for SOT ACK. Resending...");
                 continue;
             }
         }
 
         File file = new File(inputFile);
-
-        // ================= EMPTY FILE =================
-        if (file.length() == 0) {
-            DSPacket eot = new DSPacket(DSPacket.TYPE_EOT, 1, null);
-            sendPacket(socket, eot, rcvIP, rcvDataPort);
-            waitForAck(socket);
-            printTime(startTime);
-            socket.close();
-            return;
-        }
 
         if (windowSize == null) {
             stopAndWait(socket, rcvIP, rcvDataPort, inputFile);
@@ -91,6 +85,8 @@ public class Sender {
 
                 try {
                     DSPacket ack = receivePacket(socket);
+                    System.out.println("Sender: ACK received = " + ack.getSeqNum());
+
                     if (ack.getType() == DSPacket.TYPE_ACK &&
                         ack.getSeqNum() == seq) {
 
@@ -100,6 +96,9 @@ public class Sender {
                         break;
                     }
                 } catch (SocketTimeoutException e) {
+
+                    System.out.println("Sender: Timeout! Retransmitting packet SEQ = " + seq);
+
                     timeoutCount++;
                     if (timeoutCount == 3) {
                         fail();
@@ -113,6 +112,7 @@ public class Sender {
         DSPacket eot = new DSPacket(DSPacket.TYPE_EOT,
                 (lastDataSeq + 1) % MOD, null);
 
+        System.out.println("Sender: Sending EOT");
         sendPacket(socket, eot, ip, port);
         waitForAck(socket);
     }
@@ -138,7 +138,6 @@ public class Sender {
 
         while (!fileEnded || base != nextSeq) {
 
-            // Fill window
             while (!fileEnded &&
                     ((nextSeq - base + MOD) % MOD) < windowSize) {
 
@@ -157,7 +156,6 @@ public class Sender {
                 nextSeq = (nextSeq + 1) % MOD;
             }
 
-            // Send packets in groups of 4 (Chaos rule)
             List<DSPacket> toSend = new ArrayList<>();
             int seq = base;
             while (seq != nextSeq) {
@@ -165,19 +163,14 @@ public class Sender {
                 seq = (seq + 1) % MOD;
             }
 
-            for (int i = 0; i < toSend.size(); i += 4) {
-                List<DSPacket> group =
-                        toSend.subList(i, Math.min(i + 4, toSend.size()));
-                List<DSPacket> permuted =
-                        ChaosEngine.permutePackets(new ArrayList<>(group));
-
-                for (DSPacket p : permuted) {
-                    sendPacket(socket, p, ip, port);
-                }
+            for (DSPacket p : toSend) {
+                sendPacket(socket, p, ip, port);
             }
 
             try {
                 DSPacket ack = receivePacket(socket);
+                System.out.println("Sender: ACK received = " + ack.getSeqNum());
+
                 if (ack.getType() == DSPacket.TYPE_ACK) {
 
                     int ackSeq = ack.getSeqNum();
@@ -190,6 +183,8 @@ public class Sender {
                 }
 
             } catch (SocketTimeoutException e) {
+
+                System.out.println("Sender: Timeout! Retransmitting window from SEQ = " + base);
 
                 timeoutCount++;
                 if (timeoutCount == 3) {
@@ -204,6 +199,7 @@ public class Sender {
                 new DSPacket(DSPacket.TYPE_EOT,
                         (lastDataSeq + 1) % MOD, null);
 
+        System.out.println("Sender: Sending EOT");
         sendPacket(socket, eot, ip, port);
         waitForAck(socket);
     }
@@ -219,6 +215,10 @@ public class Sender {
         DatagramPacket dp =
                 new DatagramPacket(data, data.length, ip, port);
         socket.send(dp);
+
+        if (packet.getType() == DSPacket.TYPE_DATA) {
+            System.out.println("Sender: Sent DATA packet SEQ = " + packet.getSeqNum());
+        }
     }
 
     private static DSPacket receivePacket(DatagramSocket socket)
@@ -237,6 +237,7 @@ public class Sender {
         while (true) {
             try {
                 DSPacket ack = receivePacket(socket);
+                System.out.println("Sender: ACK received = " + ack.getSeqNum());
                 if (ack.getType() == DSPacket.TYPE_ACK) {
                     break;
                 }

@@ -23,15 +23,22 @@ public class Receiver {
 
         Map<Integer, DSPacket> buffer = new HashMap<>();
 
+        System.out.println("Receiver started. Waiting for SOT...");
+
         // ================= HANDSHAKE =================
         while (true) {
             DSPacket packet = receivePacket(socket);
 
             if (packet.getType() == DSPacket.TYPE_SOT) {
+
+                System.out.println("Receiver: SOT received");
+
                 ackCount++;
                 if (!ChaosEngine.shouldDrop(ackCount, RN)) {
-                    sendACK(socket, senderIP,
-                            senderAckPort, 0);
+                    System.out.println("Receiver: Sending ACK for SOT");
+                    sendACK(socket, senderIP, senderAckPort, 0);
+                } else {
+                    System.out.println("Receiver: Simulating ACK loss (SOT)");
                 }
                 break;
             }
@@ -44,11 +51,15 @@ public class Receiver {
 
             if (packet.getType() == DSPacket.TYPE_EOT) {
 
+                System.out.println("Receiver: EOT received");
+
                 ackCount++;
                 if (!ChaosEngine.shouldDrop(ackCount, RN)) {
-                    sendACK(socket, senderIP,
-                            senderAckPort,
+                    System.out.println("Receiver: Sending ACK for EOT");
+                    sendACK(socket, senderIP, senderAckPort,
                             packet.getSeqNum());
+                } else {
+                    System.out.println("Receiver: Simulating ACK loss (EOT)");
                 }
                 break;
             }
@@ -56,6 +67,8 @@ public class Receiver {
             if (packet.getType() == DSPacket.TYPE_DATA) {
 
                 int seq = packet.getSeqNum();
+                System.out.println("Receiver: Packet received SEQ = " + seq);
+
                 int diff = (seq - expectedSeq + MOD) % MOD;
 
                 if (diff < windowSize) {
@@ -71,19 +84,22 @@ public class Receiver {
                     }
                 }
 
-                int ackNum =
-                        (expectedSeq - 1 + MOD) % MOD;
+                int ackNum = (expectedSeq - 1 + MOD) % MOD;
 
                 ackCount++;
                 if (!ChaosEngine.shouldDrop(ackCount, RN)) {
-                    sendACK(socket, senderIP,
-                            senderAckPort, ackNum);
+                    System.out.println("Receiver: Sending ACK = " + ackNum);
+                    sendACK(socket, senderIP, senderAckPort, ackNum);
+                } else {
+                    System.out.println("Receiver: Simulating ACK loss for SEQ = " + ackNum);
                 }
             }
         }
 
         fos.close();
         socket.close();
+
+        System.out.println("Receiver: File transfer complete.");
     }
 
     private static void sendACK(DatagramSocket socket,
