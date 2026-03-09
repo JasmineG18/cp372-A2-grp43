@@ -2,115 +2,125 @@ import java.io.*;
 import java.net.*;
 import java.util.*;
 
+/*
+ * Receiver program for DS-FTP file transfer protocol.
+ * 
+ * Responsibilities:
+ * - Establish connection with sender using SOT handshake
+ * - Receive DATA packets and maintain correct order
+ * - Simulate ACK loss using ChaosEngine
+ * - Send ACKs for received packets
+ * - Write received payloads to output file
+ * - Terminate connection using EOT handshake
+ */
+
 public class Receiver {
 
-    // Maximum sequence number range (modulo arithmetic)
+    // Sequence numbers wrap around modulo 128
     private static final int MOD = 128;
 
     public static void main(String[] args) throws Exception {
 
-        // ================= ARGUMENTS =================
-        // args[0] = Sender IP address
-        // args[1] = Port where sender receives ACKs
-        // args[2] = Port where receiver listens for data
-        // args[3] = Output file name
-        // args[4] = RN (drop frequency for ACK simulation)
-
+        // Parse command line arguments
         InetAddress senderIP = InetAddress.getByName(args[0]);
         int senderAckPort = Integer.parseInt(args[1]);
         int rcvDataPort = Integer.parseInt(args[2]);
         String outputFile = args[3];
-        int RN = Integer.parseInt(args[4]);
+        int RN = Integer.parseInt(args[4]); // Reliability parameter (ACK loss frequency)
 
-        // Socket used to receive packets from the sender
+        // Create UDP socket to receive data packets
         DatagramSocket socket = new DatagramSocket(rcvDataPort);
 
-        // File where received data will be written
+        // File output stream for writing received data
         FileOutputStream fos = new FileOutputStream(outputFile);
 
-        // Counter used to simulate ACK dropping
+        // Counter used by ChaosEngine to simulate ACK loss
         int ackCount = 0;
 
-        // Next sequence number expected by the receiver
+        // Expected next sequence number
         int expectedSeq = 1;
 
-        // Receiver window size
+        // Receiver window size (set to max to support both protocols)
         int windowSize = 128;
 
-        // Buffer to temporarily store out-of-order packets
+        // Buffer to store out-of-order packets
         Map<Integer, DSPacket> buffer = new HashMap<>();
 
+        System.out.println("Receiver started. Waiting for SOT...");
 
         // ================= HANDSHAKE =================
-        // Wait for the Start Of Transmission (SOT) packet
+        // Wait for Start-of-Transmission packet from sender
         while (true) {
 
             DSPacket packet = receivePacket(socket);
 
-            // If SOT packet arrives
             if (packet.getType() == DSPacket.TYPE_SOT) {
+
+                System.out.println("Receiver: SOT received");
 
                 ackCount++;
 
-                // Simulate possible ACK loss using ChaosEngine
+                // Simulate ACK loss using ChaosEngine
                 if (!ChaosEngine.shouldDrop(ackCount, RN)) {
-
-                    // Send ACK with sequence number 0
+                    System.out.println("Receiver: Sending ACK for SOT");
                     sendACK(socket, senderIP, senderAckPort, 0);
+                } else {
+                    System.out.println("Receiver: Simulating ACK loss (SOT)");
                 }
 
-                // Exit handshake loop and start data phase
                 break;
             }
         }
 
-
         // ================= DATA PHASE =================
-        // Continue receiving packets until End Of Transmission
+        // Receive data packets until EOT is received
         while (true) {
 
             DSPacket packet = receivePacket(socket);
 
-            // If End Of Transmission packet received
+            // Check for End-of-Transmission packet
             if (packet.getType() == DSPacket.TYPE_EOT) {
+
+                System.out.println("Receiver: EOT received");
 
                 ackCount++;
 
-                // Send final ACK unless it is intentionally dropped
+                // Send ACK for EOT (unless simulated loss)
                 if (!ChaosEngine.shouldDrop(ackCount, RN)) {
-
-                    sendACK(socket, senderIP,
-                            senderAckPort,
+                    System.out.println("Receiver: Sending ACK for EOT");
+                    sendACK(socket, senderIP, senderAckPort,
                             packet.getSeqNum());
+                } else {
+                    System.out.println("Receiver: Simulating ACK loss (EOT)");
                 }
 
-                // End receiving
                 break;
             }
 
-
-            // If the packet is a DATA packet
+            // Process DATA packets
             if (packet.getType() == DSPacket.TYPE_DATA) {
 
                 int seq = packet.getSeqNum();
 
-                // Calculate how far the packet is from expected sequence
+                System.out.println("Receiver: Packet received SEQ = " + seq);
+
+                // Calculate relative distance from expected sequence
                 int diff = (seq - expectedSeq + MOD) % MOD;
 
-                // Check if the packet falls inside the receiver window
+                // Accept packet if it falls inside receiver window
                 if (diff < windowSize) {
 
-                    // Store packet if it has not already been received
+                    // Store packet if not already buffered
                     if (!buffer.containsKey(seq)) {
                         buffer.put(seq, packet);
                     }
 
-                    // Deliver packets to the file in order
+                    // Deliver buffered packets in order
                     while (buffer.containsKey(expectedSeq)) {
 
                         DSPacket p = buffer.remove(expectedSeq);
 
-                        // Write payload data to output file
+                        // Write payload to output file
                         fos.write(p.getPayload());
 
                         // Move expected sequence forward
@@ -118,65 +128,64 @@ public class Receiver {
                     }
                 }
 
-                // ACK number is the last correctly received packet
+                // ACK the last correctly received in-order packet
                 int ackNum = (expectedSeq - 1 + MOD) % MOD;
 
                 ackCount++;
 
-                // Send ACK unless ChaosEngine decides to drop it
                 if (!ChaosEngine.shouldDrop(ackCount, RN)) {
 
-                    sendACK(socket, senderIP,
-                            senderAckPort, ackNum);
+                    System.out.println("Receiver: Sending ACK = " + ackNum);
+
+                    sendACK(socket, senderIP, senderAckPort, ackNum);
+
+                } else {
+
+                    System.out.println("Receiver: Simulating ACK loss for SEQ = " + ackNum);
                 }
             }
         }
 
-        // Close file and socket after transmission ends
+        // Close file and socket after transfer completes
         fos.close();
         socket.close();
+
+        System.out.println("Receiver: File transfer complete.");
     }
 
-
-    // ================= SEND ACK FUNCTION =================
-    // Creates and sends an ACK packet to the sender
+    /*
+     * Sends an ACK packet to the sender with the specified sequence number.
+     */
     private static void sendACK(DatagramSocket socket,
                                 InetAddress ip,
                                 int port,
                                 int seq) throws Exception {
 
-        // Create ACK packet with given sequence number
         DSPacket ack =
                 new DSPacket(DSPacket.TYPE_ACK, seq, null);
 
-        // Convert packet to byte array
         byte[] data = ack.toBytes();
 
-        // Wrap bytes into UDP datagram
         DatagramPacket dp =
                 new DatagramPacket(data, data.length, ip, port);
 
-        // Send packet
         socket.send(dp);
     }
 
-
-    // ================= RECEIVE PACKET FUNCTION =================
-    // Receives a UDP packet and converts it into a DSPacket object
+    /*
+     * Receives a packet from the UDP socket and converts it into a DSPacket object.
+     */
     private static DSPacket receivePacket(DatagramSocket socket)
             throws Exception {
 
-        // Buffer large enough for the maximum packet size
         byte[] buffer =
                 new byte[DSPacket.MAX_PACKET_SIZE];
 
         DatagramPacket dp =
                 new DatagramPacket(buffer, buffer.length);
 
-        // Wait for incoming packet
         socket.receive(dp);
 
-        // Convert received bytes into a DSPacket object
         return new DSPacket(dp.getData());
     }
 }
