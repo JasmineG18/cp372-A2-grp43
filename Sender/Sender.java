@@ -3,181 +3,206 @@ import java.net.*;
 import java.util.*;
 
 /*
- * Sender program for the DS-FTP protocol.
+ * Sender program for DS-FTP protocol.
+ * Supports two reliable data transfer protocols:
+ * 1. Stop-and-Wait
+ * 2. Go-Back-N
  *
- * Responsibilities:
- * - Initiate connection using SOT handshake
- * - Read file and send DATA packets
- * - Implement Stop-and-Wait or Go-Back-N
- * - Handle retransmissions on timeout
- * - Send EOT when transmission completes
- * - Measure total transmission time
+ * The sender reads a file, divides it into packets, and sends them
+ * to the receiver using UDP sockets. Reliability is implemented
+ * using acknowledgements (ACKs) and retransmissions on timeout.
  */
 
 public class Sender {
 
-    // Sequence numbers wrap modulo 128
+    // Sequence numbers wrap around modulo 128
     private static final int MOD = 128;
 
     public static void main(String[] args) throws Exception {
 
+        // Validate command-line arguments
         if (args.length < 5) {
-            System.out.println("Invalid arguments");
+            System.out.println("Usage: java Sender <IP> <RCV_DATA_PORT> <SENDER_ACK_PORT> <file> <timeout> [windowSize]");
             return;
         }
 
-        // Parse command line arguments
+        // Receiver IP address
         InetAddress rcvIP = InetAddress.getByName(args[0]);
+
+        // Receiver data port
         int rcvDataPort = Integer.parseInt(args[1]);
+
+        // Sender port used to receive ACKs
         int senderAckPort = Integer.parseInt(args[2]);
+
+        // File to send
         String inputFile = args[3];
+
+        // Timeout value for waiting ACKs
         int timeout = Integer.parseInt(args[4]);
 
-        // If window size provided → use Go-Back-N
-        Integer windowSize = null;
-        if (args.length == 6) {
-            windowSize = Integer.parseInt(args[5]);
-        }
+        // Optional window size → if provided we use Go-Back-N
+        Integer windowSize = args.length == 6 ? Integer.parseInt(args[5]) : null;
 
-        // Create socket for sending and receiving ACKs
+        // Create UDP socket and configure timeout
         DatagramSocket socket = new DatagramSocket(senderAckPort);
-
-        // Configure timeout for ACK reception
         socket.setSoTimeout(timeout);
 
-        // Start measuring transmission time
+        // Start time for measuring transmission time
         long startTime = System.nanoTime();
 
         // ================= HANDSHAKE =================
-        // Send Start-of-Transmission packet
+        // Send Start-of-Transmission (SOT) packet to initiate transfer
         DSPacket sot = new DSPacket(DSPacket.TYPE_SOT, 0, null);
-
         System.out.println("Sender: Sending SOT");
 
+        // Keep sending SOT until receiver acknowledges
         while (true) {
-
             sendPacket(socket, sot, rcvIP, rcvDataPort);
-
             try {
-
                 DSPacket ack = receivePacket(socket);
 
-                // Connection established when ACK for SOT received
+                // Expect ACK with sequence number 0
                 if (ack.getType() == DSPacket.TYPE_ACK && ack.getSeqNum() == 0) {
-
                     System.out.println("Sender: ACK received for SOT");
                     break;
                 }
 
             } catch (SocketTimeoutException e) {
-
-                // Retransmit SOT if ACK lost
-                System.out.println("Sender: Timeout waiting for SOT ACK. Resending...");
+                System.out.println("Sender: Timeout! Resending SOT");
             }
         }
 
-        // Select protocol
-        if (windowSize == null) {
-
+        // Choose protocol depending on presence of window size
+        if (windowSize == null)
             stopAndWait(socket, rcvIP, rcvDataPort, inputFile);
-
-        } else {
-
+        else
             goBackN(socket, rcvIP, rcvDataPort, inputFile, windowSize);
-        }
 
+        // Close socket after transfer
         socket.close();
 
+        // Print total transmission time
         printTime(startTime);
     }
 
+    // ================= STOP-AND-WAIT PROTOCOL =================
     /*
-     * STOP-AND-WAIT PROTOCOL
-     *
-     * Only one packet may be outstanding at a time.
-     * Sender waits for ACK before sending next packet.
+     * Sends one packet at a time.
+     * Sender waits for ACK before sending the next packet.
+     * If timeout occurs, the packet is retransmitted.
      */
     private static void stopAndWait(DatagramSocket socket,
                                     InetAddress ip,
                                     int port,
                                     String fileName) throws Exception {
 
+        System.out.println("Sender: Starting Stop-and-Wait file transfer...");
+
+        // Open file for reading
         FileInputStream fis = new FileInputStream(fileName);
 
+        // Buffer for reading file chunks
         byte[] buffer = new byte[DSPacket.MAX_PAYLOAD_SIZE];
 
+        // First data packet sequence number (0 was used by SOT)
         int seq = 1;
-        int timeoutCount = 0;
+
+        // Track last data packet sequence number for EOT
         int lastDataSeq = 0;
 
         int read;
 
+        // Read file chunk-by-chunk
         while ((read = fis.read(buffer)) != -1) {
 
+            System.out.println("\nSender: Sending DATA packet SEQ = " + seq);
+
+            // Copy only actual bytes read into payload
             byte[] payload = Arrays.copyOf(buffer, read);
 
+            // Create DATA packet
             DSPacket packet = new DSPacket(DSPacket.TYPE_DATA, seq, payload);
 
-            while (true) {
+            int timeoutCount = 0;
+            boolean ackReceived = false;
 
-                sendPacket(socket, packet, ip, port);
+            // Send packet for the first time
+            sendPacket(socket, packet, ip, port);
+
+            // Wait until correct ACK received
+            while (!ackReceived) {
 
                 try {
 
+                    // Receive ACK packet
                     DSPacket ack = receivePacket(socket);
 
                     System.out.println("Sender: ACK received = " + ack.getSeqNum());
 
-                    if (ack.getType() == DSPacket.TYPE_ACK) {
+                    // Check if ACK matches expected sequence
+                    if (ack.getType() == DSPacket.TYPE_ACK && ack.getSeqNum() == seq) {
 
-                        int ackSeq = ack.getSeqNum();
+                        System.out.println("Sender: Correct ACK received for SEQ = " + seq);
 
-                        // Accept correct ACK or cumulative ACK
-                        if (ackSeq == seq ||
-                                ((ackSeq - seq + MOD) % MOD) < 5) {
+                        ackReceived = true;
 
-                            lastDataSeq = seq;
+                        // Update last sent sequence
+                        lastDataSeq = seq;
 
-                            seq = (seq + 1) % MOD;
-
-                            timeoutCount = 0;
-
-                            break;
-                        }
+                        // Increment sequence number with wrap-around
+                        seq = (seq + 1) % MOD;
+                    }
+                    else {
+                        // Ignore incorrect or duplicate ACKs
+                        System.out.println("Sender: Wrong ACK ignored");
                     }
 
-                } catch (SocketTimeoutException e) {
-
-                    System.out.println("Sender: Timeout! Retransmitting packet SEQ = " + seq);
+                }
+                catch (SocketTimeoutException e) {
 
                     timeoutCount++;
 
-                    if (timeoutCount == 3) {
-                        fail();
+                    System.out.println("Sender: Timeout #" + timeoutCount +
+                            " for packet SEQ = " + seq);
+
+                    // If 3 consecutive timeouts occur, abort transfer
+                    if (timeoutCount >= 3) {
+                        System.out.println("Unable to transfer file.");
+                        System.exit(0);
                     }
+
+                    // Retransmit the same packet
+                    System.out.println("Sender: Retransmitting packet SEQ = " + seq);
+                    sendPacket(socket, packet, ip, port);
                 }
             }
         }
 
+        // Close file
         fis.close();
 
-        // Send End-of-Transmission packet
-        DSPacket eot = new DSPacket(DSPacket.TYPE_EOT,
-                (lastDataSeq + 1) % MOD, null);
+        System.out.println("\nSender: File data transfer completed!");
+
+        // ================= SEND EOT =================
+        // End-of-Transmission packet
+        DSPacket eot = new DSPacket(
+                DSPacket.TYPE_EOT,
+                (lastDataSeq + 1) % MOD,
+                null);
 
         System.out.println("Sender: Sending EOT");
 
         sendPacket(socket, eot, ip, port);
 
+        // Wait for final ACK
         waitForAck(socket);
     }
 
+    // ================= GO-BACK-N PROTOCOL =================
     /*
-     * GO-BACK-N PROTOCOL
-     *
-     * Multiple packets may be sent without waiting for ACKs.
-     * Sender maintains a sliding window.
-     * On timeout → retransmit entire window.
+     * Allows sending multiple packets within a window.
+     * If timeout occurs, all packets in the window are retransmitted.
      */
     private static void goBackN(DatagramSocket socket,
                                 InetAddress ip,
@@ -186,42 +211,34 @@ public class Sender {
                                 int windowSize) throws Exception {
 
         FileInputStream fis = new FileInputStream(fileName);
-
         byte[] buffer = new byte[DSPacket.MAX_PAYLOAD_SIZE];
 
-        int base = 1;
-        int nextSeq = 1;
-
-        int timeoutCount = 0;
-
+        int base = 1;      // First unacknowledged packet
+        int nextSeq = 1;   // Next sequence number to send
         int lastDataSeq = 0;
-
-        Map<Integer, DSPacket> window = new HashMap<>();
-
         boolean fileEnded = false;
+
+        // Store packets currently in the window
+        Map<Integer, DSPacket> window = new HashMap<>();
 
         while (!fileEnded || base != nextSeq) {
 
             // Fill window with new packets
-            while (!fileEnded &&
-                    ((nextSeq - base + MOD) % MOD) < windowSize) {
+            while (!fileEnded && ((nextSeq - base + MOD) % MOD) < windowSize) {
 
                 int read = fis.read(buffer);
 
                 if (read == -1) {
-
                     fileEnded = true;
                     break;
                 }
 
                 byte[] payload = Arrays.copyOf(buffer, read);
 
-                DSPacket packet =
-                        new DSPacket(DSPacket.TYPE_DATA, nextSeq, payload);
+                DSPacket packet = new DSPacket(DSPacket.TYPE_DATA, nextSeq, payload);
 
                 window.put(nextSeq, packet);
 
-                // SEND packet immediately when created
                 sendPacket(socket, packet, ip, port);
 
                 lastDataSeq = nextSeq;
@@ -231,51 +248,40 @@ public class Sender {
 
             try {
 
+                // Wait for ACK
                 DSPacket ack = receivePacket(socket);
 
                 System.out.println("Sender: ACK received = " + ack.getSeqNum());
 
-                if (ack.getType() == DSPacket.TYPE_ACK) {
+                int ackSeq = ack.getSeqNum();
 
-                    int ackSeq = ack.getSeqNum();
-
-                    // Slide window forward
-                    if (((ackSeq - base + MOD) % MOD) < windowSize) {
-
-                        base = (ackSeq + 1) % MOD;
-
-                        timeoutCount = 0;
-                    }
+                // Slide window forward
+                if (((ackSeq - base + MOD) % MOD) < windowSize) {
+                    base = (ackSeq + 1) % MOD;
                 }
 
-            } catch (SocketTimeoutException e) {
+            }
+            catch (SocketTimeoutException e) {
 
+                // Timeout → retransmit entire window
                 System.out.println("Sender: Timeout! Retransmitting window from SEQ = " + base);
 
                 int seq = base;
 
                 while (seq != nextSeq) {
-
-                    DSPacket p = window.get(seq);
-
-                    sendPacket(socket, p, ip, port);
-
+                    sendPacket(socket, window.get(seq), ip, port);
                     seq = (seq + 1) % MOD;
-                }
-
-                timeoutCount++;
-
-                if (timeoutCount == 3) {
-                    fail();
                 }
             }
         }
 
         fis.close();
 
-        DSPacket eot =
-                new DSPacket(DSPacket.TYPE_EOT,
-                        (lastDataSeq + 1) % MOD, null);
+        // Send End-of-Transmission packet
+        DSPacket eot = new DSPacket(
+                DSPacket.TYPE_EOT,
+                (lastDataSeq + 1) % MOD,
+                null);
 
         System.out.println("Sender: Sending EOT");
 
@@ -284,8 +290,9 @@ public class Sender {
         waitForAck(socket);
     }
 
-    // ================= UTILITIES =================
+    // ================= HELPER METHODS =================
 
+    // Send a DSPacket using UDP socket
     private static void sendPacket(DatagramSocket socket,
                                    DSPacket packet,
                                    InetAddress ip,
@@ -293,32 +300,27 @@ public class Sender {
 
         byte[] data = packet.toBytes();
 
-        DatagramPacket dp =
-                new DatagramPacket(data, data.length, ip, port);
+        socket.send(new DatagramPacket(data, data.length, ip, port));
 
-        socket.send(dp);
-
-        if (packet.getType() == DSPacket.TYPE_DATA) {
-
-            System.out.println("Sender: Sent DATA packet SEQ = " + packet.getSeqNum());
-        }
+        // Print message for DATA packets
+        if (packet.getType() == DSPacket.TYPE_DATA)
+            System.out.println("Sender: Sent DATA SEQ = " + packet.getSeqNum());
     }
 
-    private static DSPacket receivePacket(DatagramSocket socket)
-            throws Exception {
+    // Receive a packet from socket and convert to DSPacket
+    private static DSPacket receivePacket(DatagramSocket socket) throws Exception {
 
         byte[] buffer = new byte[DSPacket.MAX_PACKET_SIZE];
 
-        DatagramPacket dp =
-                new DatagramPacket(buffer, buffer.length);
+        DatagramPacket dp = new DatagramPacket(buffer, buffer.length);
 
         socket.receive(dp);
 
         return new DSPacket(dp.getData());
     }
 
-    private static void waitForAck(DatagramSocket socket)
-            throws Exception {
+    // Wait until an ACK is received (used after EOT)
+    private static void waitForAck(DatagramSocket socket) throws Exception {
 
         while (true) {
 
@@ -326,11 +328,8 @@ public class Sender {
 
                 DSPacket ack = receivePacket(socket);
 
-                System.out.println("Sender: ACK received = " + ack.getSeqNum());
-
-                if (ack.getType() == DSPacket.TYPE_ACK) {
+                if (ack.getType() == DSPacket.TYPE_ACK)
                     break;
-                }
 
             } catch (SocketTimeoutException e) {
                 continue;
@@ -338,13 +337,7 @@ public class Sender {
         }
     }
 
-    private static void fail() {
-
-        System.out.println("Unable to transfer file.");
-
-        System.exit(0);
-    }
-
+    // Print total transmission time
     private static void printTime(long start) {
 
         double seconds = (System.nanoTime() - start) / 1e9;
